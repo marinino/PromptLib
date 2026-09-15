@@ -4,7 +4,12 @@ import type { ExecutionResponse, VersionResponse } from "../api/types";
 import { ErrorBox, Note, Panel, formatInstant, statusClass } from "./ui";
 
 const POLL_INTERVAL_MS = 800;
-const MAX_POLLS = 40;
+// Muss laenger sein als das Backend im schlimmsten Fall braucht, bis eine Execution terminal
+// wird: mit dem echten Client 3 Versuche x read-timeout 15 s + 0,2 s + 0,4 s Backoff ~ 46 s,
+// dazu Wartezeit in der Executor-Queue. Frueher waren es 40 Polls = 32 s - das UI hoerte
+// still auf, waehrend die Execution noch RUNNING war.
+const MAX_POLL_DURATION_MS = 60_000;
+const MAX_POLLS = Math.ceil(MAX_POLL_DURATION_MS / POLL_INTERVAL_MS);
 const TERMINAL = ["SUCCEEDED", "FAILED"];
 
 export function ExecutionPanel({
@@ -21,6 +26,7 @@ export function ExecutionPanel({
   const [watched, setWatched] = useState<ExecutionResponse | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
+  const [pollGaveUp, setPollGaveUp] = useState(false);
 
   const cancelled = useRef(false);
   useEffect(() => {
@@ -60,6 +66,7 @@ export function ExecutionPanel({
 
     setBusy(true);
     setError(null);
+    setPollGaveUp(false);
     try {
       // 202 Accepted: die Zeile existiert, die Arbeit hat noch nicht begonnen.
       const accepted = await createExecution({
@@ -69,7 +76,10 @@ export function ExecutionPanel({
         inputParams: parsed,
       });
       setWatched(accepted);
-      await poll(accepted.id);
+      const finished = await poll(accepted.id);
+      if (!finished && !cancelled.current) {
+        setPollGaveUp(true);
+      }
     } catch (e) {
       setError(e);
     } finally {
@@ -78,19 +88,24 @@ export function ExecutionPanel({
     }
   }
 
-  /** Pollt GET /executions/{id}, bis der Status terminal ist - jeder Poll steht im Log. */
-  async function poll(executionId: string) {
+  /**
+   * Pollt GET /executions/{id}, bis der Status terminal ist - jeder Poll steht im Log.
+   * Liefert true, wenn ein terminaler Status erreicht wurde; false bei Abbruch oder wenn
+   * MAX_POLLS aufgebraucht ist, waehrend die Execution noch laeuft.
+   */
+  async function poll(executionId: string): Promise<boolean> {
     for (let attempt = 0; attempt < MAX_POLLS; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       if (cancelled.current) {
-        return;
+        return false;
       }
       const current = await getExecution(executionId);
       setWatched(current);
       if (TERMINAL.includes(current.status)) {
-        return;
+        return true;
       }
     }
+    return false;
   }
 
   return (
@@ -137,6 +152,13 @@ export function ExecutionPanel({
       <ErrorBox error={error} />
 
       {watched !== null && <StatusTimeline execution={watched} />}
+      {pollGaveUp && (
+        <div className="error">
+          Polling nach {MAX_POLL_DURATION_MS / 1000} s beendet — die Ausfuehrung ist noch nicht
+          abgeschlossen und laeuft im Backend weiter. Spaeter "Liste neu laden", um das Ergebnis
+          zu sehen.
+        </div>
+      )}
 
       <Note>
         <b>Der Request wartet nicht auf das LLM.</b> <code>POST</code> antwortet sofort mit{" "}

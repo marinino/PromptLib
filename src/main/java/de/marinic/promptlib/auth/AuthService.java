@@ -4,6 +4,7 @@ import de.marinic.promptlib.auth.dto.AuthResponse;
 import de.marinic.promptlib.auth.dto.LoginRequest;
 import de.marinic.promptlib.common.security.AppUserPrincipal;
 import de.marinic.promptlib.common.security.JwtService;
+import de.marinic.promptlib.user.EmailAddresses;
 import de.marinic.promptlib.user.User;
 import de.marinic.promptlib.user.UserService;
 import de.marinic.promptlib.user.dto.RegisterRequest;
@@ -42,7 +43,7 @@ public class AuthService {
         Authentication authentication =
                 authenticationManager.authenticate(
                         new UsernamePasswordAuthenticationToken(
-                                request.email().trim().toLowerCase(), request.password()));
+                                EmailAddresses.normalize(request.email()), request.password()));
 
         var principal = (AppUserPrincipal) authentication.getPrincipal();
         return new AuthResponse(jwtService.generateToken(principal.getId(), principal.getUsername()));

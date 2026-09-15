@@ -7,7 +7,9 @@ import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -123,6 +125,58 @@ class PromptControllerTest {
         mockMvc.perform(get("/api/v1/prompts/{id}", id).with(TestPrincipals.user(userId)))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404));
+    }
+
+    // Regression tests: Spring's own client-error exceptions used to be swallowed by
+    // GlobalExceptionHandler's catch-all and come back as 500.
+    @Test
+    void getWithNonUuidIdReturns400() throws Exception {
+        mockMvc.perform(get("/api/v1/prompts/{id}", "not-a-uuid").with(TestPrincipals.user(userId)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400));
+    }
+
+    @Test
+    void unsupportedMethodReturns405() throws Exception {
+        mockMvc.perform(
+                        put("/api/v1/prompts/{id}", UUID.randomUUID())
+                                .with(TestPrincipals.user(userId))
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{}"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(header().exists("Allow"));
+    }
+
+    // null means "leave unchanged" for a PATCH, so @NotBlank (which also rejects null) can't be
+    // used - but an explicitly sent title must still not be blank, same as on create.
+    @Test
+    void updateWithBlankTitleReturns400() throws Exception {
+        mockMvc.perform(
+                        patch("/api/v1/prompts/{id}", UUID.randomUUID())
+                                .with(TestPrincipals.user(userId))
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("""
+                                        {"title":"   "}
+                                        """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("title"));
+    }
+
+    @Test
+    void updateWithoutTitleIsStillAllowed() throws Exception {
+        UUID id = UUID.randomUUID();
+        Instant now = Instant.now();
+        given(promptService.update(eq(id), any(), eq(userId)))
+                .willReturn(new PromptResponse(id, "Test", null, 1, Set.of(), userId, Visibility.PUBLIC, now, now));
+
+        mockMvc.perform(
+                        patch("/api/v1/prompts/{id}", id)
+                                .with(TestPrincipals.user(userId))
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("""
+                                        {"visibility":"PUBLIC"}
+                                        """))
+                .andExpect(status().isOk());
     }
 
     @Test

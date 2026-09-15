@@ -12,10 +12,16 @@ Der vollständige Feature- und Umsetzungsplan steht in [promptlib-featureplan.md
 
 ```bash
 docker compose up -d
-./mvnw spring-boot:run
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
 ```
 
 `GET /actuator/health` sollte danach `{"status":"UP"}` liefern.
+
+Das Profil `dev` liefert ein JWT-Secret für die lokale Entwicklung. Ohne Profil startet die App
+nur, wenn die Umgebungsvariable `JWT_SECRET` gesetzt ist (mindestens 32 Zeichen). Ein Default in
+`application.properties` gibt es bewusst nicht mehr: er stand öffentlich im Repo, und eine
+vergessene Variable beim Deployment wäre niemandem aufgefallen, während jeder mit dem Default
+gültige Tokens für beliebige Nutzer hätte signieren können.
 
 Manuelle Requests: [requests/prompts.http](requests/prompts.http).
 
@@ -312,6 +318,16 @@ einer schlicht vertippten ID käme und gegen eine laufende API deutlich schwerer
 `requireOwner` darf deshalb ausdrücklich **nicht** zusätzlich mit `requireReadable` abgesichert
 werden — das würde den getesteten `403` still in einen `404` verwandeln.
 
+**Registrierte E-Mails sind über `/register` erkennbar, bewusst:** Der Login antwortet für
+"unbekannte E-Mail" und "falsches Passwort" absichtlich gleich (und Springs
+`DaoAuthenticationProvider` rechnet bei unbekannter E-Mail sogar einen Dummy-BCrypt-Hash, damit
+man es auch nicht an der Antwortzeit erkennt). `POST /auth/register` verrät es trotzdem: eine
+bereits registrierte Adresse gibt `409`, eine neue `201`. Das echte Verstecken bräuchte eine
+Registrierung mit Bestätigungsmail, die immer gleich antwortet ("Wir haben dir eine E-Mail
+geschickt") — die gibt es hier nicht, und ohne sie würde ein echter Nutzer mit bestehendem Konto
+nie erfahren, warum seine Registrierung nichts bewirkt. Der Login-Schutz verhindert also nur,
+dass **dieser** Endpunkt die Information liefert, nicht, dass sie insgesamt verborgen bleibt.
+
 **Stolperfalle beim `@WebMvcTest` der Controller:** Mit Spring Security auf dem Classpath wird
 `JwtAuthenticationFilter` als `Filter`-Bean automatisch Teil jedes `@WebMvcTest`-Slices (Boot zählt
 `Filter`-Implementierungen zu den slice-relevanten Typen) — sein Konstruktor braucht dann aber
@@ -347,6 +363,68 @@ Regressionstest: `AuthFlowIntegrationTest.protectedEndpointWithoutTokenReturns40
 `listByPrompt()` lädt dafür zusätzlich `PromptRepository` (nach demselben Muster wie
 `PromptVersionService.list()`). Regressionstest (echtes HTTP, zwei echte Nutzer):
 `ExecutionOwnershipIntegrationTest.executionsOfAPrivatePromptAreOnlyVisibleToItsOwner`.
+
+### Nachträgliche Fixes aus einem Code-Review
+
+**Client-Fehler kamen als `500` zurück.** Der Catch-all `@ExceptionHandler(Exception.class)` im
+`GlobalExceptionHandler` fing auch Springs eigene Exceptions für Client-Fehler ab, bevor Spring
+selbst den richtigen Status setzen konnte: ein HTML-Formular an einen JSON-Endpunkt (eigentlich
+`415`), eine falsche HTTP-Methode (`405`), eine ID, die keine UUID ist (`400`) — alles wurde
+`500 "An unexpected error occurred"` und als `ERROR` geloggt. Fix: Exceptions, die Springs
+`ErrorResponse` implementieren, bringen Status, Header und `ProblemDetail` selbst mit und werden
+jetzt durchgereicht. `MethodArgumentTypeMismatchException` gehört **nicht** dazu und hat einen
+eigenen Handler. Regressionstests: `AuthControllerTest.loginWithFormBodyReturns415`,
+`PromptControllerTest.unsupportedMethodReturns405` / `getWithNonUuidIdReturns400`.
+
+**`PATCH` konnte Prompts ohne Titel erzeugen.** Beim Anlegen gilt `@NotBlank`, beim Ändern stand
+nur `@Size(max = 200)` — und das erlaubt `""`. `@NotBlank` geht beim `PATCH` nicht, weil es auch
+`null` ablehnt, und `null` heißt dort "nicht ändern". Fix: `@Pattern(regexp = "(?s).*\\S.*")` —
+wie fast alle Bean-Validation-Annotationen ignoriert `@Pattern` `null` und prüft nur einen
+tatsächlich gesendeten Wert.
+
+**Tag-Liste verriet Tags fremder privater Prompts.** `GET /api/v1/tags` zählte über **alle**
+Prompts. Tag-Namen sind Nutzereingaben, also sah jeder eingeloggte Nutzer die Tag-Namen (und
+Anzahl) der privaten Prompts anderer. Ursache war strukturell: `TagController` rief das Repository
+direkt auf und bekam den Aufrufer gar nicht erst mit — alle Zugriffsregeln leben aber in den
+Services. Fix: `TagService`, und die Query zählt nur Prompts, die der Aufrufer sehen darf (dieselbe
+Regel wie `PromptSpecifications.visibleTo`). Regressionstest:
+`TagVisibilityIntegrationTest`.
+
+**Race bei der Registrierung gab `500` statt `409`.** `existsByEmail()` und das Speichern sind
+zwei Schritte — dieselbe Lücke wie ursprünglich beim Tag-Anlegen. Zwei gleichzeitige
+Registrierungen kamen beide an der Prüfung vorbei, der Verlierer scheiterte am `UNIQUE`-Constraint
+erst beim Commit, also außerhalb von `register()`. Fix: `saveAndFlush()` statt `save()`, damit der
+`INSERT` noch innerhalb der Methode passiert und die `DataIntegrityViolationException` dort in
+dieselbe `ConflictException` übersetzt werden kann. Regressionstest:
+`UserRegistrationConcurrencyTest`.
+
+**E-Mail-Normalisierung hing von der Server-Sprache ab.** `toLowerCase()` ohne Argument benutzt die
+Default-Locale der JVM; unter Türkisch wird aus `I` ein `ı` ohne Punkt, `INFO@FIRMA.DE` also zu
+`ınfo@fırma.de`. Außerdem stand die Normalisierung doppelt in `UserService` und `AuthService` —
+ändert sich nur eine Seite, kommen bestehende Nutzer nicht mehr rein. Fix: eine gemeinsame
+Methode `EmailAddresses.normalize()` mit `Locale.ROOT`. Regressionstest: `EmailAddressesTest`.
+
+**Default-JWT-Secret.** Siehe [Setup](#setup): der öffentliche Default in `application.properties`
+ist weg, `JwtService` bricht den Start ohne Secret mit einer klaren Meldung ab. Das Dev-Secret lebt
+nur noch im Profil `dev`, die Tests bekommen ihres über `src/test/resources/config/
+application.properties` — bewusst in `config/`, denn eine gleichnamige Datei direkt in
+`src/test/resources` würde die Haupt-`application.properties` komplett **ersetzen** statt sie zu
+ergänzen. Regressionstest: `JwtServiceTest`.
+
+**Executions hingen nach einem Neustart für immer.** Die Executor-Queue lebt nur im Speicher. Nach
+einem Absturz holt niemand eine `PENDING`-Zeile je wieder ab, und der Thread einer
+`RUNNING`-Zeile ist schlicht weg. Fix: `ExecutionRecovery` beim `ApplicationReadyEvent` —
+`PENDING` hat nie angefangen und wird erneut eingereiht, `RUNNING` wird `FAILED`, weil das LLM
+eventuell schon aufgerufen (und bezahlt) wurde und ein zweiter Lauf doppelt kosten würde. Nur
+Zeilen, die **vor** dem Start dieser Instanz angelegt wurden, sonst würde eine Execution, die ein
+früher Request gerade regulär angestoßen hat, doppelt laufen. Setzt eine einzige Instanz voraus: mit
+mehreren würde eine neu startende Instanz auch Executions "retten", die eine andere gerade
+ausführt. Regressionstest: `ExecutionRecoveryIntegrationTest`.
+
+**Frontend hörte still auf zu pollen.** 40 Polls à 800 ms = 32 s, das Backend braucht mit dem
+echten Client im schlimmsten Fall aber 3 × 15 s Read-Timeout + 0,2 s + 0,4 s Backoff ≈ 46 s,
+plus Wartezeit in der Queue. Das UI zeigte danach dauerhaft `RUNNING` ohne jeden Hinweis. Fix:
+60 s Polling und eine sichtbare Meldung, wenn danach noch kein Endstatus erreicht ist.
 
 ## Tests
 
