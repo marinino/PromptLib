@@ -20,6 +20,13 @@ public class JwtService {
     private final long expirationMs;
 
     public JwtService(JwtProperties properties) {
+        // Fail fast with a message that says what to do. Keys.hmacShaKeyFor() would reject an
+        // empty secret too, but only with a cryptic WeakKeyException about key bits.
+        if (properties.secret() == null || properties.secret().isBlank()) {
+            throw new IllegalStateException(
+                    "promptlib.jwt.secret is not set. Set the JWT_SECRET environment variable,"
+                            + " or run locally with the 'dev' profile.");
+        }
         this.key = Keys.hmacShaKeyFor(properties.secret().getBytes(StandardCharsets.UTF_8));
         this.expirationMs = properties.expirationMs();
     }

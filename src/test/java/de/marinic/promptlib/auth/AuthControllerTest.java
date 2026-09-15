@@ -83,4 +83,18 @@ class AuthControllerTest {
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.detail").value("Invalid email or password"));
     }
+
+    // Regression test: a plain HTML form posting to this JSON endpoint used to come back as
+    // 500 "An unexpected error occurred" (logged as ERROR), because GlobalExceptionHandler's
+    // catch-all swallowed Spring's own HttpMediaTypeNotSupportedException before Spring
+    // could turn it into the 415 it already carries.
+    @Test
+    void loginWithFormBodyReturns415() throws Exception {
+        mockMvc.perform(
+                        post("/api/v1/auth/login")
+                                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                                .content("email=noah%40example.com&password=supersecret"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.status").value(415));
+    }
 }
